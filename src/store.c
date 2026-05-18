@@ -65,7 +65,7 @@ int ht_set(HashTable *ht, const char *key, const char *val) {
     strncpy(new_entry->key,key,sizeof(new_entry->key) - 1);
     new_entry->key[sizeof(new_entry->key) -1] = '\0'; 
     strncpy(new_entry->val,val,sizeof(new_entry->val) - 1);
-    new_entry->val[sizeof(new_entry->key) - 1] = '\0';
+    new_entry->val[sizeof(new_entry->val) - 1] = '\0';
 
     // prepend to chain
     new_entry->next = ht->buckets[index];
@@ -76,19 +76,76 @@ int ht_set(HashTable *ht, const char *key, const char *val) {
 }
     
 // ht_get() - find key, return value pointer or NULL
+char *ht_get(HashTable *ht, const char *key) {
+    unsigned int index = hash(key);
+
+    //start at first node of the bucket
+    Entry *curr = ht->buckets[index];
+
+    while (curr != NULL) {
+        if (strcmp(curr->key, key) == 0) {
+            return curr->val;
+        }
+
+        curr = curr->next;
+    }
+
+    return NULL;
+
+}
 
 // ht_del() - remove key from chain
-// need prev pointer to relink
+int ht_del(HashTable *ht, const char *key) {
+    unsigned int index = hash(key);
 
-// ht_exists() - return 1 or 0
+    Entry *curr = ht->buckets[index];
+    Entry *prev = NULL;
 
-// ht_destroy() - free everything
+    while (curr != NULL) {
+        if(strcmp(curr->key, key) == 0) {
+            // if it is the forst node in the bucket
+            if (prev == NULL) {
+                ht->buckets[index] = curr->next;
+            }
 
-int main(void) {
-    HashTable *ht = ht_create();
-    ht_set(ht, "name", "Sandesh");
-    ht_set(ht, "city", "Kathmandu");
-    ht_set(ht, "name", "Ojha");  // update
-    printf("count = %d\n", ht->count);  // must print 2
+            //if it is in the middle or end
+            else {
+                prev->next = curr->next; //bridge the gap
+            }
+
+            //memory cleanup
+            free(curr);
+            ht->count--;
+
+            return 1;
+        }
+
+        prev = curr;
+        curr = curr->next;
+    }
+
     return 0;
 }
+
+
+// ht_exists() - return 1 or 0
+int ht_exists(HashTable *ht, const char *key) {
+    if (ht_get(ht, key) != NULL) {
+        return 1;
+    }
+    return 0;
+}
+
+// ht_destroy() - free everything
+void ht_destroy(HashTable *ht) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        Entry *curr = ht->buckets[i];
+        while (curr != NULL) {
+            Entry *next_node = curr->next;
+            free(curr);
+            curr = next_node;
+        }
+    }
+    free(ht); //destroy the main table
+}
+
