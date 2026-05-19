@@ -6,7 +6,9 @@
 #include <netinet/in.h>
 #include <errno.h>
 
-void parse_commands(char *buf, int client_fd);
+#include "store.h"
+
+void parse_commands(char *buf, int client_fd, HashTable *ht);
 int read_line(int fd, char *buf, int size);
 
 int main() {
@@ -43,36 +45,33 @@ int main() {
 
     printf("KV store waiting for connections..\n");
 
-    // accept one connection
-    struct sockaddr_in client_addr = {0};
-    socklen_t client_len = sizeof(client_addr);
+   HashTable *ht = ht_create();
+if (ht == NULL) { fprintf(stderr, "ht_create failed\n"); return 1; }
 
-    // This blocks until someone connects
-    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-    if (client_fd < 0) {
-        perror("accept failed");
-        return 1;
-    }
+// accept loop
+struct sockaddr_in client_addr = {0};
+socklen_t client_len = sizeof(client_addr);
 
-    printf("Client Connected\n");
+int client_fd = accept(server_fd,
+                       (struct sockaddr *)&client_addr,
+                       &client_len);
+if (client_fd < 0) { perror("accept"); return 1; }
 
-    char buf[4096];
-    int  n;
-    while (1) {
+printf("Client connected\n");
+
+char buf[4096];
+int  n;
+while (1) {
     n = read_line(client_fd, buf, sizeof(buf));
     if (n <= 0) break;
     printf("[server] received: '%s'\n", buf);
-    parse_commands(buf, client_fd);
+    parse_commands(buf, client_fd, ht);  // three args
 }
 
-    printf("Client disconnected");
-    // close client fd
-    close(client_fd);
-
-    // close server fd
-    close(server_fd);
-
-    return 0;
+printf("Client disconnected\n");
+close(client_fd);
+ht_destroy(ht);
+close(server_fd);
 
 }
 
