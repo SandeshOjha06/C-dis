@@ -3,18 +3,7 @@
 #include <unistd.h>
 #include <string.h>
 
-#define HASH_SIZE 1024
-
-typedef struct Entry {
-    char         key[64];
-    char         val[256];
-    struct Entry *next;
-} Entry;
-
-typedef struct {
-    Entry *buckets[HASH_SIZE];
-    int    count;
-} HashTable;
+#include "store.h"
 
 // hash() - private function
 static unsigned int hash(const char *key) {
