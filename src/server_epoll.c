@@ -12,7 +12,7 @@
 void parse_commands(char *buf, int client_fd, HashTable *ht);
 int  read_line(int fd, char *buf, int size);
 
-void server_run_epoll(int server_fd, HashTable *ht, int log_fd) {
+void server_run_epoll(int server_fd, HashTable *ht) {
 
     // epoll_create1 create epoll instance
     int epfd = epoll_create1(0);
