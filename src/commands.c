@@ -3,6 +3,12 @@
 #include <unistd.h>
 
 #include "store.h"
+#include "persist.h"
+
+static void respond(int fd, const char *msg) {
+    if (fd == -1) return;   // replay mode - don't send responses
+    write(fd, msg, strlen(msg));
+}
 
 void parse_commands(char *buf, int client_fd, HashTable *ht) {
      // strip trailing \r\n first
@@ -18,29 +24,34 @@ void parse_commands(char *buf, int client_fd, HashTable *ht) {
     char *key = strtok_r(NULL, " ", &saveptr);
     char *val = strtok_r(NULL, " ", &saveptr);
     if (!key || !val) {
-        write(client_fd, "-ERR SET requires key and value\n", 32);
+        respond(client_fd, "-ERR SET requires key and value\n");
         return;
     }
+    if (g_log_fd != -1) {
+    char logline[512];
+    snprintf(logline, sizeof(logline), "SET %s %s\n", key, val);
+    wal_write(g_log_fd, logline);
+}
+
     ht_set(ht, key, val);
-    write(client_fd, "+OK\n", 4);
+    respond(client_fd, "+OK\n");
 }
 
     else if (strcmp(cmd, "GET") == 0) {
         char *key = strtok_r(NULL, " ", &saveptr);
 
         if (!key) {
-            write(client_fd, "-ERR GET requires key\n",
-                  strlen("-ERR GET requires key\n"));
+            respond(client_fd, "-ERR GET requires key\n");
             return;
         }
 
        char *found = ht_get(ht, key);
 if (found == NULL) {
-    write(client_fd, "-ERR key not found\n", 19);
+    respond(client_fd, "-ERR key not found\n");
 } else {
     char resp[512];
-    int rlen = snprintf(resp, sizeof(resp), "$%s\n", found);
-    write(client_fd, resp, rlen);
+    snprintf(resp, sizeof(resp), "$%s\n", found);
+    respond(client_fd, resp);
 }
 
     
@@ -50,22 +61,26 @@ if (found == NULL) {
         char *key = strtok_r(NULL, " ", &saveptr);
 
         if (!key) {
-            write(client_fd, "-ERR DEL requires key\n",
-                  strlen("-ERR DEL requires key\n"));
+            respond(client_fd, "-ERR DEL requires key\n");
             return;
         }
 
+        if (g_log_fd != -1) {
+    char logline[256];
+    snprintf(logline, sizeof(logline), "DEL %s\n", key);
+    wal_write(g_log_fd, logline);
+}
+
        if (ht_del(ht, key)) {
-    write(client_fd, ":1\n", 3);
+    respond(client_fd, ":1\n");
 } else {
-    write(client_fd, ":0\n", 3);
+    respond(client_fd, ":0\n");
 }
        
     }
 
         else {
-        write(client_fd, "-ERR unknown command\n",
-              strlen("-ERR unknown command\n"));
+        respond(client_fd, "-ERR unknown command\n");
     }
 
 }
