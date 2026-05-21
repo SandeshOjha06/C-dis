@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "store.h"
 
@@ -103,3 +104,24 @@ void server_run(int server_fd, HashTable *ht) {
         
     } 
 } 
+
+int read_line(int fd, char *buf, int size) {
+    int  total = 0;
+    char c;
+    int  n;
+
+    while (total < size - 1) {
+        n = read(fd, &c, 1);
+        if (n == 1) {
+            buf[total++] = c;
+            if (c == '\n') { buf[total] = '\0'; return total; }
+        }
+        else if (n == 0) { buf[total] = '\0'; return 0; }
+        else {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+    }
+    buf[total] = '\0';
+    return total;
+}

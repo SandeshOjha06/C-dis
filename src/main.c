@@ -1,105 +1,44 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <errno.h>
 
 #include "store.h"
 
-void parse_commands(char *buf, int client_fd, HashTable *ht);
-int read_line(int fd, char *buf, int size);
+void server_run(int server_fd, HashTable *ht);
 
-int main() {
-    // create socket fd
-    int server_fd = socket(AF_INET,SOCK_STREAM,0);
-    if (server_fd < 0) {
-        perror("socket error");
-        return 1;
-    }
+int main(void) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return 1; }
 
-    // allow port reuse
     int val = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) == -1) {
-    perror("setsockopt");
-    return 1;
-}
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+                   &val, sizeof(val)) == -1) {
+        perror("setsockopt"); return 1;
+    }
+
     struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET; // sets the address fakily to IPv4
-    addr.sin_port = htons(6379); // setting port to 6379
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // tells the socket to bind to all available network interfaces
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(6379);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); return 1;
+    }
 
-    // bind socket to address
-    if(bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0){
-        perror("bind error");
-        return 1;
-    };
-
-    // start listeing, queue upto 10 conns
     if (listen(server_fd, 10) < 0) {
-        perror("listen failed");
-        return 1;
+        perror("listen"); return 1;
     }
 
-    printf("KV store waiting for connections..\n");
+    printf("KV store listening on port 6379\n");
 
-   HashTable *ht = ht_create();
-if (ht == NULL) { fprintf(stderr, "ht_create failed\n"); return 1; }
+    HashTable *ht = ht_create();
+    if (!ht) { fprintf(stderr, "ht_create failed\n"); return 1; }
 
-// accept loop
-struct sockaddr_in client_addr = {0};
-socklen_t client_len = sizeof(client_addr);
+    server_run(server_fd, ht);
 
-int client_fd = accept(server_fd,
-                       (struct sockaddr *)&client_addr,
-                       &client_len);
-if (client_fd < 0) { perror("accept"); return 1; }
-
-printf("Client connected\n");
-
-char buf[4096];
-int  n;
-while (1) {
-    n = read_line(client_fd, buf, sizeof(buf));
-    if (n <= 0) break;
-    printf("[server] received: '%s'\n", buf);
-    parse_commands(buf, client_fd, ht);  // three args
-}
-
-printf("Client disconnected\n");
-close(client_fd);
-ht_destroy(ht);
-close(server_fd);
-
-}
-
-int read_line(int fd, char *buf, int size) {
-    int total = 0;
-    char c;
-    int  n;
-
-    while (total < size - 1) {
-        n = read(fd, &c, 1);
-
-        if (n == 1) {
-            buf[total++] = c;
-            if (c == '\n') {
-                buf[total] = '\0';   // null terminate
-                return total;        // return byte count
-            }
-        }
-        else if (n == 0) {
-            buf[total] = '\0';
-            return total;            // EOF
-        }
-        else {
-            if (errno == EINTR) continue;
-            return -1;               // real error
-        }
-    }
-
-    buf[total] = '\0';
-    return total;
+    ht_destroy(ht);
+    close(server_fd);
+    return 0;
 }
