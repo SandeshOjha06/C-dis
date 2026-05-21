@@ -5,8 +5,11 @@
 #include <netinet/in.h>
 
 #include "store.h"
+#include "persist.h"
 
-void server_run(int server_fd, HashTable *ht);
+void server_run_epoll(int server_fd, HashTable *ht);
+int wal_open(const char *path);
+void wal_replay(const char *path, HashTable *ht);
 
 int main(void) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -35,8 +38,10 @@ int main(void) {
 
     HashTable *ht = ht_create();
     if (!ht) { fprintf(stderr, "ht_create failed\n"); return 1; }
-
-    server_run(server_fd, ht);
+      g_log_fd = -1;                           // disable logging
+    wal_replay("kvstore.log", ht);           // replay without writing
+    g_log_fd = wal_open("kvstore.log");      // enable logging after
+    server_run_epoll(server_fd, ht);
 
     ht_destroy(ht);
     close(server_fd);
