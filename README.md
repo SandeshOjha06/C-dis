@@ -1,4 +1,5 @@
 # C-dis: Multiplexed Key-Value Store
+*C-dis (C + Redis) — a Redis-inspired key-value store built in C.*
 
 **A high-performance, single-threaded, in-memory database built from scratch in C99.**
 
