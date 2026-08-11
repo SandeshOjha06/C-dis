@@ -1,0 +1,54 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-store-network
+  labels:
+    app: kvstore
+spec:
+  clusterIP: None       # headless
+  ports:
+  - port: 6379
+    name: kv-port
+    targetPort: 6379
+  selector:
+    app: kvstore
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kv-store
+spec:
+  serviceName: "kv-store-network"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kvstore
+  template:
+    metadata:
+      labels:
+        app: kvstore
+    spec:
+      # Ensures the pod doesn't try to pull from Docker Hub
+      containers:
+      - name: kvstore
+        image: custom-kv-store:v1
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 6379
+          name: kv-port
+        volumeMounts:
+        - name: wal-storage
+          mountPath: /app/data
+        # Security Context enforcing the non-root setup
+        securityContext:
+          runAsNonRoot: true
+  volumeClaimTemplates:
+  - metadata:
+      name: wal-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
