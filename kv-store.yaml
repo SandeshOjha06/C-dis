@@ -33,8 +33,8 @@ spec:
       # Ensures the pod doesn't try to pull from Docker Hub
       containers:
       - name: kvstore
-        image: custom-kv-store:v1
-        imagePullPolicy: Never
+        image: sandeshojha/custom-kv-store:v1
+        imagePullPolicy: Always
         ports:
         - containerPort: 6379
           name: kv-port
@@ -42,8 +42,8 @@ spec:
         - name: wal-storage
           mountPath: /app/data
         # Security Context enforcing the non-root setup
-        securityContext:
-          runAsNonRoot: true
+        # securityContext:
+        #   runAsNonRoot: true
   volumeClaimTemplates:
   - metadata:
       name: wal-storage
