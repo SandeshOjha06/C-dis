@@ -2,13 +2,28 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <netdb.h>      
+#include <sys/types.h>
+#include <sys/socket.h>
 
 #include "store.h"
 #include "persist.h"
 
+extern int my_node_id;
+extern int cluster_size;
+
 static void respond(int fd, const char *msg) {
     if (fd == -1) return;   // replay mode - don't send responses
     write(fd, msg, strlen(msg));
+}
+
+static unsigned int get_target_node(const char *key) {
+    unsigned long int hashval = 5381;
+    int c;
+    while ((c = *key++)) {
+        hashval = ((hashval << 5) + hashval) + c;
+    }
+    return hashval % cluster_size;
 }
 
 void parse_commands(char *buf, int client_fd, HashTable *ht) {
