@@ -33,8 +33,11 @@ spec:
       # Ensures the pod doesn't try to pull from Docker Hub
       containers:
       - name: kvstore
-        image: sandeshojha/custom-kv-store:v1
+        image: sandeshojha/custom-kv-store:v2
         imagePullPolicy: Always
+        env:                                   
+        - name: CLUSTER_SIZE
+          value: "3"
         ports:
         - containerPort: 6379
           name: kv-port
