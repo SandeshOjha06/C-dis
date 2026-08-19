@@ -4,8 +4,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "persist.h"
 #include "store.h"
+#include "persist.h"
 
 void server_run_epoll(int server_fd, HashTable *ht);
 int wal_open(const char *path);
