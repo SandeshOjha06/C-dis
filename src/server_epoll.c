@@ -8,10 +8,73 @@
 #include <string.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 
 #include "store.h"
 
 #define PEER_PORT "6379"
+#define MAX_NODES 16
+
+static int peer_sockets[MAX_NODES];
+static int *peer_by_fd = NULL;
+static int *pending_peer_node = NULL;
+static int max_fds = 0;
+
+static void registry_init(void) {
+    for (int i = 0; i < MAX_NODES; i++) peer_sockets[i] = -1;
+
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur > 0) {
+        max_fds = (int)rl.rlim_cur;
+    } else {
+        max_fds = 1024; // fallback
+    }
+    if (max_fds > 65536) max_fds = 65536; // sanity cap
+
+    peer_by_fd = calloc(max_fds, sizeof(int));
+    pending_peer_node = calloc(max_fds, sizeof(int));
+    if (!peer_by_fd || !pending_peer_node) {
+        perror("calloc registry");
+        exit(1);
+    }
+    for (int i = 0; i < max_fds; i++) {
+        peer_by_fd[i] = -1;
+        pending_peer_node[i] = -1;
+    }
+    printf("[registry] Initialized with max_fds=%d\n", max_fds);
+}
+
+static void registry_register(int node_id, int fd) {
+    if (node_id < 0 || node_id >= MAX_NODES) return;
+    if (fd < 0 || fd >= max_fds) return;
+
+    // If a stale socket exists for this node, clean it up first
+    int old_fd = peer_sockets[node_id];
+    if (old_fd != -1 && old_fd != fd) {
+        if (old_fd < max_fds) peer_by_fd[old_fd] = -1;
+        // Note: we don't close old_fd here; caller handles epoll/close
+    }
+
+    peer_sockets[node_id] = fd;
+    peer_by_fd[fd] = node_id;
+    pending_peer_node[fd] = -1;
+    printf("[registry] Registered node %d -> fd %d\n", node_id, fd);
+}
+
+static void registry_unregister(int fd) {
+    if (fd < 0 || fd >= max_fds) return;
+    int node = peer_by_fd[fd];
+    if (node != -1) {
+        if (peer_sockets[node] == fd) peer_sockets[node] = -1;
+        peer_by_fd[fd] = -1;
+        printf("[registry] Unregistered node %d (fd %d)\n", node, fd);
+    }
+}
+
+static int peer_fd_for_node(int node_id) {
+    if (node_id < 0 || node_id >= MAX_NODES) return -1;
+    return peer_sockets[node_id];
+}
 
 void parse_commands(char *buf, int client_fd, HashTable *ht);
 int  read_line(int fd, char *buf, int size);
@@ -95,6 +158,15 @@ void bootstrap_cluster_peers(int epoll_fd) {
             continue;
         }
 
+        // Extract target node_id from DNS name (format: kv-store-N.kv-store-network)
+        int target_node = -1;
+        sscanf(peer_dns, "kv-store-%d.kv-store-network", &target_node);
+        if (target_node >= 0 && target_node < MAX_NODES) {
+            if (peer_sock < max_fds) pending_peer_node[peer_sock] = target_node;
+        } else {
+            fprintf(stderr, "[cluster] Could not parse node_id from %s\n", peer_dns);
+        }
+
         // Add socket to epoll instance.
         // EPOLLOUT notifies when connection handshakes complete; EPOLLIN detects data/disconnections.
         struct epoll_event ev;
@@ -105,7 +177,7 @@ void bootstrap_cluster_peers(int epoll_fd) {
             perror("[cluster] epoll_ctl failed for peer socket");
             close(peer_sock);
         } else {
-            printf("[cluster] Registered peer socket fd=%d for host %s\n", peer_sock, peer_dns);
+            printf("[cluster] Registered peer socket fd=%d for host %s (target node %d)\n", peer_sock, peer_dns, target_node);
         }
 
         freeaddrinfo(res);
@@ -134,6 +206,9 @@ void server_run_epoll(int server_fd, HashTable *ht) {
         close(epfd);
         return;
     }
+
+    // Initialize peer registry
+    registry_init();
 
     // Dial out to sibling cluster pods using the injected topology
     bootstrap_cluster_peers(epfd);
@@ -172,17 +247,40 @@ void server_run_epoll(int server_fd, HashTable *ht) {
                 printf("Connection established: fd=%d\n", client_fd);
 
             } else {
-                int client_fd = events[i].data.fd;
-                char buf[4096];
+                int fd = events[i].data.fd;
+                uint32_t evts = events[i].events;
 
-                int bytes = read_line(client_fd, buf, sizeof(buf));
+                // Handle connection completion for outbound peer connections
+                if ((evts & EPOLLOUT) && fd < max_fds && pending_peer_node[fd] != -1) {
+                    int node = pending_peer_node[fd];
+                    // Verify connection succeeded
+                    int err = 0;
+                    socklen_t len = sizeof(err);
+                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+                        registry_register(node, fd);
+                        // Switch to EPOLLIN only; we don't need EPOLLOUT anymore
+                        struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = fd };
+                        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+                    } else {
+                        fprintf(stderr, "[cluster] Peer connection failed for node %d (fd %d): %s\n",
+                                node, fd, strerror(err));
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                        close(fd);
+                        pending_peer_node[fd] = -1;
+                    }
+                    continue;
+                }
+
+                char buf[4096];
+                int bytes = read_line(fd, buf, sizeof(buf));
 
                 if (bytes <= 0) {
-                    printf("Socket closed/disconnected: fd=%d\n", client_fd);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, client_fd, NULL);
-                    close(client_fd);
+                    printf("Socket closed/disconnected: fd=%d\n", fd);
+                    registry_unregister(fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                    close(fd);
                 } else {
-                    parse_commands(buf, client_fd, ht);
+                    parse_commands(buf, fd, ht);
                 }
             }
         }
