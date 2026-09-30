@@ -12,12 +12,24 @@
 
 #include "store.h"
 
+extern int my_node_id;
+extern int cluster_size;
+
 #define PEER_PORT "6379"
 #define MAX_NODES 16
+
+typedef enum { ROLE_UNKNOWN = 0, ROLE_CLIENT, ROLE_PEER } conn_role_t;
+
+typedef struct {
+    int fd;
+    conn_role_t role;
+    int peer_node_id;   // valid only if role == ROLE_PEER, else -1
+} conn_t;
 
 static int peer_sockets[MAX_NODES];
 static int *peer_by_fd = NULL;
 static int *pending_peer_node = NULL;
+static conn_t *connections = NULL;
 static int max_fds = 0;
 
 static void registry_init(void) {
@@ -33,13 +45,17 @@ static void registry_init(void) {
 
     peer_by_fd = calloc(max_fds, sizeof(int));
     pending_peer_node = calloc(max_fds, sizeof(int));
-    if (!peer_by_fd || !pending_peer_node) {
+    connections = calloc(max_fds, sizeof(conn_t));
+    if (!peer_by_fd || !pending_peer_node || !connections) {
         perror("calloc registry");
         exit(1);
     }
     for (int i = 0; i < max_fds; i++) {
         peer_by_fd[i] = -1;
         pending_peer_node[i] = -1;
+        connections[i].fd = i;
+        connections[i].role = ROLE_UNKNOWN;
+        connections[i].peer_node_id = -1;
     }
     printf("[registry] Initialized with max_fds=%d\n", max_fds);
 }
@@ -71,9 +87,19 @@ static void registry_unregister(int fd) {
     }
 }
 
-static int peer_fd_for_node(int node_id) {
+int peer_fd_for_node(int node_id) {
     if (node_id < 0 || node_id >= MAX_NODES) return -1;
     return peer_sockets[node_id];
+}
+
+int get_connection_role(int fd) {
+    if (fd < 0 || fd >= max_fds) return ROLE_UNKNOWN;
+    return connections[fd].role;
+}
+
+int get_peer_node_id(int fd) {
+    if (fd < 0 || fd >= max_fds) return -1;
+    return connections[fd].peer_node_id;
 }
 
 void parse_commands(char *buf, int client_fd, HashTable *ht);
@@ -236,6 +262,11 @@ void server_run_epoll(int server_fd, HashTable *ht) {
 
                 set_nonblocking(client_fd);
 
+                if (client_fd < max_fds) {
+                    connections[client_fd].role = ROLE_UNKNOWN;
+                    connections[client_fd].peer_node_id = -1;
+                }
+
                 ev.events  = EPOLLIN | EPOLLET;
                 ev.data.fd = client_fd;
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
@@ -258,6 +289,10 @@ void server_run_epoll(int server_fd, HashTable *ht) {
                     socklen_t len = sizeof(err);
                     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
                         registry_register(node, fd);
+                        if (fd < max_fds) {
+                            connections[fd].role = ROLE_PEER;
+                            connections[fd].peer_node_id = node;
+                        }
                         // Switch to EPOLLIN only; we don't need EPOLLOUT anymore
                         struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = fd };
                         epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -277,9 +312,34 @@ void server_run_epoll(int server_fd, HashTable *ht) {
                 if (bytes <= 0) {
                     printf("Socket closed/disconnected: fd=%d\n", fd);
                     registry_unregister(fd);
+                    if (fd < max_fds) {
+                        connections[fd].role = ROLE_UNKNOWN;
+                        connections[fd].peer_node_id = -1;
+                    }
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
                 } else {
+                    // Handle HELLO handshake for inbound peer connections
+                    if (fd < max_fds && connections[fd].role == ROLE_UNKNOWN) {
+                        if (strncmp(buf, "HELLO ", 6) == 0) {
+                            int node = atoi(buf + 6);
+                            if (node >= 0 && node < MAX_NODES && node != my_node_id && peer_sockets[node] == -1) {
+                                connections[fd].role = ROLE_PEER;
+                                connections[fd].peer_node_id = node;
+                                registry_register(node, fd);
+                                printf("[cluster] Inbound peer handshake: node %d on fd %d\n", node, fd);
+                            } else {
+                                fprintf(stderr, "[cluster] Invalid HELLO from fd %d: node=%d (my_id=%d, occupied=%d)\n",
+                                        fd, node, my_node_id, peer_sockets[node] != -1);
+                                // Treat as client
+                                connections[fd].role = ROLE_CLIENT;
+                            }
+                            continue;  // Handshake consumed, wait for next line
+                        } else {
+                            // Not a peer handshake -> client
+                            connections[fd].role = ROLE_CLIENT;
+                        }
+                    }
                     parse_commands(buf, fd, ht);
                 }
             }
