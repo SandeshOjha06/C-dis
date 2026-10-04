@@ -30,7 +30,7 @@ int main(void) {
 
   char *hostname = getenv("HOSTNAME");
   if (hostname != NULL) {
-    sscanf(hostname, "my-database-sts-%d", &my_node_id);
+    sscanf(hostname, "kv-store-%d", &my_node_id);
     printf("[boot] Starting node %d of %d\n", my_node_id, cluster_size);
   }
 
