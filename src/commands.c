@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "store.h"
 #include "persist.h"
@@ -13,6 +14,7 @@ extern int cluster_size;
 extern int peer_fd_for_node(int node_id);
 extern int get_connection_role(int fd);
 extern int get_peer_node_id(int fd);
+extern bool forward_to_peer_node(int target_node, const void *data, size_t len);
 
 typedef enum { ROLE_UNKNOWN = 0, ROLE_CLIENT, ROLE_PEER } conn_role_t;
 
@@ -31,15 +33,11 @@ static unsigned int get_target_node(const char *key) {
 }
 
 void parse_commands(char *buf, int client_fd, HashTable *ht) {
-    // save copy for forwarding
-    char raw_cmd[4096];
-    strncpy(raw_cmd, buf, sizeof(raw_cmd) - 1);
-    raw_cmd[sizeof(raw_cmd) - 1] = '\0';
-
-    // strip trailing \r\n first
-    int len = strlen(buf);
-    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
-        buf[--len] = '\0';
+    // Build the forward copy. The read path now strips the line terminator,
+    // so append '\n' explicitly — the peer's line-based parser requires it.
+    char raw_cmd[5120];
+    int raw_len = snprintf(raw_cmd, sizeof(raw_cmd), "%s\n", buf);
+    if (raw_len < 0 || raw_len >= (int)sizeof(raw_cmd)) return;
 
     char *saveptr;
     char *cmd = strtok_r(buf, " ", &saveptr);  // split on space
@@ -55,14 +53,10 @@ void parse_commands(char *buf, int client_fd, HashTable *ht) {
             conn_role_t role = (conn_role_t)get_connection_role(client_fd);
 
             if (role == ROLE_CLIENT) {
-                // Forward once to the target peer
-                int peer_fd = peer_fd_for_node(target_node);
-                if (peer_fd == -1) {
-                    respond(client_fd, "-ERR peer unreachable\n");
-                    return;
+                // Forward once to the target peer (non-blocking via egress buffer)
+                if (!forward_to_peer_node(target_node, raw_cmd, (size_t)raw_len)) {
+                    respond(client_fd, "-ERR peer unreachable or buffer full\n");
                 }
-                // Forward the raw command (includes trailing \n from original)
-                write(peer_fd, raw_cmd, strlen(raw_cmd));
                 return;
             } else if (role == ROLE_PEER) {
                 // Forwarding loop detected - peer trying to forward to another peer

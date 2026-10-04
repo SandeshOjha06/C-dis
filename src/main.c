@@ -75,10 +75,10 @@ int main(void) {
   wal_replay(wal_path, ht);      
   g_log_fd = wal_open(wal_path); 
 
-  // Start the network mesh
+  // Start the network mesh (owns the server_fd lifecycle and shutdown)
   server_run_epoll(server_fd, ht);
 
   ht_destroy(ht);
-  close(server_fd);
+  // Note: server_fd is closed inside server_run_epoll (graceful shutdown)
   return 0;
 }

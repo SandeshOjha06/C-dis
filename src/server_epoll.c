@@ -9,17 +9,25 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <signal.h>
+#include <time.h>
 
 #include "store.h"
+#include "persist.h"
 #include <stdbool.h>
 
 extern int my_node_id;
 extern int cluster_size;
 
+void parse_commands(char *buf, int client_fd, HashTable *ht);
+
 #define PEER_PORT "6379"
 #define MAX_NODES 16
 #define EGRESS_BUF_INIT 4096
 #define EGRESS_BUF_MAX  (64 * 1024)  // 64KB high-water mark
+#define READ_BUF_INIT 4096           // read buffer, grows on demand
+#define READ_BUF_MAX  (256 * 1024)   // read buffer hard cap
+#define MAX_LINE_LEN  4095           // max command line size
 
 typedef enum { ROLE_UNKNOWN = 0, ROLE_CLIENT, ROLE_PEER } conn_role_t;
 
@@ -27,6 +35,9 @@ typedef struct {
     int fd;
     conn_role_t role;
     int peer_node_id;       // valid only if role == ROLE_PEER, else -1
+    uint8_t *rbuf;          // ingress (read) buffer, allocated on first use
+    size_t rbuf_cap;        // allocated capacity
+    size_t rlen;            // valid bytes in buffer
     uint8_t *wbuf;          // egress buffer
     size_t wbuf_cap;        // allocated capacity
     size_t woff;            // write offset (bytes already sent)
@@ -40,6 +51,16 @@ static int *pending_peer_node = NULL;
 static conn_t *connections = NULL;
 static int max_fds = 0;
 static int g_epfd = -1;  // epoll fd for append_to_wbuf
+
+// ── Graceful shutdown state ─────────────────────────────────────────
+// The signal handler only sets a flag (async-signal-safe rule);
+// all cleanup happens in the main loop / post-loop shutdown phase.
+static volatile sig_atomic_t shutdown_requested = 0;
+
+static void shutdown_handler(int sig) {
+    (void)sig;
+    shutdown_requested = 1;
+}
 
 static void registry_init(void) {
     for (int i = 0; i < MAX_NODES; i++) peer_sockets[i] = -1;
@@ -65,6 +86,9 @@ static void registry_init(void) {
         connections[i].fd = i;
         connections[i].role = ROLE_UNKNOWN;
         connections[i].peer_node_id = -1;
+        connections[i].rbuf = NULL;
+        connections[i].rbuf_cap = 0;
+        connections[i].rlen = 0;
         connections[i].wbuf = NULL;
         connections[i].wbuf_cap = 0;
         connections[i].woff = 0;
@@ -202,8 +226,121 @@ bool forward_to_peer_node(int target_node, const void *data, size_t len) {
     return append_to_wbuf(g_epfd, peer_fd, data, len);
 }
 
-void parse_commands(char *buf, int client_fd, HashTable *ht);
-int  read_line(int fd, char *buf, int size);
+// Fully clean up a connection: registry, buffers, role, epoll, socket.
+static void close_connection(int epfd, int fd) {
+    if (fd < 0) return;
+    printf("Socket closed/disconnected: fd=%d\n", fd);
+    registry_unregister(fd);
+    free_wbuf(fd);
+    if (fd < max_fds) {
+        free(connections[fd].rbuf);
+        connections[fd].rbuf = NULL;
+        connections[fd].rbuf_cap = 0;
+        connections[fd].rlen = 0;
+        connections[fd].role = ROLE_UNKNOWN;
+        connections[fd].peer_node_id = -1;
+    }
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+}
+
+// Reads all currently-available data into the connection's read buffer and
+// processes every complete line (\n-terminated). Must drain to EAGAIN under
+// EPOLLET, or the remaining bytes will never generate another event.
+// Returns true if the connection should stay open, false on EOF/error.
+static bool handle_inbound(int fd, HashTable *ht) {
+    conn_t *c = &connections[fd];
+
+    // Peer sockets are created in bootstrap (not via accept) — lazy-allocate.
+    if (!c->rbuf) {
+        c->rbuf = malloc(READ_BUF_INIT);
+        if (!c->rbuf) return false;
+        c->rbuf_cap = READ_BUF_INIT;
+        c->rlen = 0;
+    }
+
+    for (;;) {
+        // 1) Process all complete lines already in the buffer
+        while (c->rlen > 0) {
+            uint8_t *nl = memchr(c->rbuf, '\n', c->rlen);
+            if (!nl) break;
+            size_t line_len = (size_t)(nl - c->rbuf);
+            if (line_len > MAX_LINE_LEN) {
+                fprintf(stderr, "[io] Line exceeds %d bytes on fd %d, closing\n", MAX_LINE_LEN, fd);
+                return false;
+            }
+            char line[MAX_LINE_LEN + 1];
+            memcpy(line, c->rbuf, line_len);
+            line[line_len] = '\0';
+
+            if (c->role == ROLE_UNKNOWN) {
+                if (strncmp(line, "HELLO ", 6) == 0) {
+                    int node = atoi(line + 6);
+                    if (node >= 0 && node < MAX_NODES && node != my_node_id && peer_sockets[node] == -1) {
+                        c->role = ROLE_PEER;
+                        c->peer_node_id = node;
+                        registry_register(node, fd);
+                        printf("[cluster] Inbound peer handshake: node %d on fd %d\n", node, fd);
+                    } else {
+                        fprintf(stderr, "[cluster] Invalid HELLO from fd %d: node=%d (my_id=%d, occupied=%d)\n",
+                                fd, node, my_node_id, peer_sockets[node] != -1);
+                        c->role = ROLE_CLIENT;
+                    }
+                    // Handshake line is consumed, not treated as a command
+                } else {
+                    c->role = ROLE_CLIENT;
+                    parse_commands(line, fd, ht);
+                }
+            } else {
+                parse_commands(line, fd, ht);
+            }
+
+            memmove(c->rbuf, nl + 1, c->rlen - line_len - 1);
+            c->rlen -= line_len + 1;
+        }
+
+        // 2) Make space, then read all available data
+        if (c->rlen >= c->rbuf_cap) {
+            if (c->rbuf_cap >= READ_BUF_MAX) {
+                fprintf(stderr, "[io] Read buffer overflow on fd %d, closing\n", fd);
+                return false;
+            }
+            size_t nc = c->rbuf_cap * 2;
+            if (nc > READ_BUF_MAX) nc = READ_BUF_MAX;
+            uint8_t *nb = realloc(c->rbuf, nc);
+            if (!nb) return false;
+            c->rbuf = nb;
+            c->rbuf_cap = nc;
+        }
+
+        ssize_t n = read(fd, c->rbuf + c->rlen, c->rbuf_cap - c->rlen);
+        if (n > 0) {
+            c->rlen += (size_t)n;
+            continue;   // keep processing lines / reading (EPOLLET requirement)
+        }
+        if (n == 0) return false;                    // clean EOF
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;  // fully drained
+        return false;                                // real error
+    }
+}
+
+// Bounded drain of all peer egress buffers (~2 s max so we never exceed the
+// k8s grace period). Peer TCP send stays non-blocking; we simply retry.
+static void final_drain(int epfd) {
+    for (int attempt = 0; attempt < 100; attempt++) {
+        bool pending = false;
+        for (int i = 0; i < max_fds; i++) {
+            if (connections[i].role == ROLE_PEER && connections[i].wlen > 0) {
+                drain_wbuf(epfd, i);
+                pending = connections[i].wlen > 0;
+            }
+        }
+        if (!pending) break;
+        struct timespec ts = { 0, 20 * 1000 * 1000 };  // 20 ms
+        nanosleep(&ts, NULL);
+    }
+}
 
 // Helper function to configure sockets for asynchronous non-blocking I/O
 void set_nonblocking(int fd) {
@@ -340,9 +477,18 @@ void server_run_epoll(int server_fd, HashTable *ht) {
     // Dial out to sibling cluster pods using the injected topology
     bootstrap_cluster_peers(epfd);
 
+    // Install graceful-shutdown handlers (SIGTERM from k8s, SIGINT from Ctrl+C).
+    // No SA_RESTART: epoll_wait returns EINTR, the loop condition re-checks the flag.
+    struct sigaction sa = {0};
+    sa.sa_handler = shutdown_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
     struct epoll_event events[64];
 
-    while (1) {
+    while (!shutdown_requested) {
         int n = epoll_wait(epfd, events, 64, -1);
         if (n == -1) {
             if (errno == EINTR) continue;
@@ -364,6 +510,14 @@ void server_run_epoll(int server_fd, HashTable *ht) {
                 set_nonblocking(client_fd);
 
                 if (client_fd < max_fds) {
+                    connections[client_fd].rbuf = malloc(READ_BUF_INIT);
+                    if (!connections[client_fd].rbuf) {
+                        perror("malloc read buffer");
+                        close(client_fd);
+                        continue;
+                    }
+                    connections[client_fd].rbuf_cap = READ_BUF_INIT;
+                    connections[client_fd].rlen = 0;
                     connections[client_fd].role = ROLE_UNKNOWN;
                     connections[client_fd].peer_node_id = -1;
                 }
@@ -416,78 +570,50 @@ void server_run_epoll(int server_fd, HashTable *ht) {
                 }
 
                 if (evts & EPOLLIN) {
-                    char buf[4096];
-                    int bytes = read_line(fd, buf, sizeof(buf));
-
-                    if (bytes <= 0) {
-                        printf("Socket closed/disconnected: fd=%d\n", fd);
-                        registry_unregister(fd);
-                        free_wbuf(fd);
-                        if (fd < max_fds) {
-                            connections[fd].role = ROLE_UNKNOWN;
-                            connections[fd].peer_node_id = -1;
-                        }
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                        close(fd);
-                    } else {
-                        // Handle HELLO handshake for inbound peer connections
-                        if (fd < max_fds && connections[fd].role == ROLE_UNKNOWN) {
-                            if (strncmp(buf, "HELLO ", 6) == 0) {
-                                int node = atoi(buf + 6);
-                                if (node >= 0 && node < MAX_NODES && node != my_node_id && peer_sockets[node] == -1) {
-                                    connections[fd].role = ROLE_PEER;
-                                    connections[fd].peer_node_id = node;
-                                    registry_register(node, fd);
-                                    printf("[cluster] Inbound peer handshake: node %d on fd %d\n", node, fd);
-                                } else {
-                                    fprintf(stderr, "[cluster] Invalid HELLO from fd %d: node=%d (my_id=%d, occupied=%d)\n",
-                                            fd, node, my_node_id, peer_sockets[node] != -1);
-                                    // Treat as client
-                                    connections[fd].role = ROLE_CLIENT;
-                                }
-                                continue;  // Handshake consumed, wait for next line
-                            } else {
-                                // Not a peer handshake -> client
-                                connections[fd].role = ROLE_CLIENT;
-                            }
-                        }
-                        parse_commands(buf, fd, ht);
+                    if (!handle_inbound(fd, ht)) {
+                        close_connection(epfd, fd);
                     }
                 }
             }
         }
     }
 
-    close(epfd);
-}
+    // ── Graceful shutdown ─────────────────────────────────────────────
+    printf("[shutdown] Signal received, shutting down gracefully...\n");
 
-int read_line(int fd, char *buf, int size) {
-    int  total = 0;
-    char c;
-    int  n;
+    // Phase 1: stop the tap — no new connections
+    epoll_ctl(epfd, EPOLL_CTL_DEL, server_fd, NULL);
+    close(server_fd);
 
-    while (total < size - 1) {
-        n = read(fd, &c, 1);
+    // Phase 2: bounded drain of peer egress buffers (~2 s max)
+    final_drain(epfd);
 
-        if (n == 1) {
-            buf[total++] = c;
-            if (c == '\n') {
-                buf[total] = '\0';
-                return total;
-            }
-        } else if (n == 0) {
-            buf[total] = '\0';
-            return 0; // EOF
-        } else {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Non-blocking socket drained for now
-                break;
-            }
-            return -1;
+    // Phase 3: close all live connections (peers see a clean EOF)
+    for (int i = 0; i < max_fds; i++) {
+        if (i != server_fd && (connections[i].role != ROLE_UNKNOWN || connections[i].rbuf != NULL)) {
+            close_connection(epfd, i);
         }
     }
 
-    buf[total] = '\0';
-    return total;
+    close(epfd);
+    g_epfd = -1;
+
+    // Phase 4: flush + close WAL (durability-critical step)
+    if (g_log_fd != -1) {
+        if (fsync(g_log_fd) == -1) {
+            perror("[shutdown] WAL fsync failed");
+        }
+        close(g_log_fd);
+        g_log_fd = -1;
+    }
+
+    // Phase 5: release registry arrays
+    free(peer_by_fd);
+    free(pending_peer_node);
+    free(connections);
+    peer_by_fd = NULL;
+    pending_peer_node = NULL;
+    connections = NULL;
+
+    printf("[shutdown] Clean exit\n");
 }
